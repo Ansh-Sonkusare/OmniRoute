@@ -34,7 +34,7 @@
   publishedAt = "2026-08-28T16:19:48.276Z";
 
   hashes = {
-    x86_64-linux = "sha256-WZdlaC/sngiRCJxXTVhhRk79v4DnDxbYUXUtXirFlvY=";
+    x86_64-linux = "sha256-JbdJndoVHtw1juTQmC9qIXVfwn8IER6Z/wblY2VlacA=";
   };
 
   npmInstall = stdenv.mkDerivation {

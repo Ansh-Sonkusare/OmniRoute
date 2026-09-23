@@ -13,7 +13,7 @@
         nodejs = pkgs.nodejs_22;
       in
       {
-        packages.default = pkgs.callPackage ./nix/omniroute.nix { inherit nodejs; };
+        packages.default = pkgs.callPackage ./nix/omniroute.nix { nodejs = pkgs.nodejs_24; };
         packages.omniroute = self.packages.${system}.default;
 
         devShells.default = pkgs.mkShell {
