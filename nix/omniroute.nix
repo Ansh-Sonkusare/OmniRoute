@@ -1,106 +1,77 @@
-# OmniRoute has a workspace-based package-lock.json that references local
-# workspace packages (@omniroute/browser-pool, open-sse, packages/browser-pool).
-# `buildNpmPackage` uses `npm ci --offline` inside the Nix sandbox, which
-# cannot resolve those workspace links. Instead this is built in two stages:
+# Builds the published npm tarball with `buildNpmPackage`.
 #
-#   1. `npmInstall`: a fixed-output derivation that runs
-#      `npm install -g omniroute@<version>` with network access. Fixup is
-#      disabled so the output is exactly what npm produced (no shebang
-#      patching, no store-path references), which keeps `outputHash` stable
-#      across nixpkgs updates.
-#   2. `omniroute`: a normal derivation that only wraps the installed bins with
-#      the matching Node.js, without copying the (multi-GB) tree.
+# The tarball ships no lockfile, so `package-lock.json` here is generated from
+# `package.json`, which is the published manifest minus `workspaces` and
+# `devDependencies`. The app in the tarball is prebuilt, so dev tools are not
+# needed. Their nested `overrides` also pin conflicting versions (undici,
+# js-yaml), which makes npm ask the registry for metadata and fails offline.
+# All `overrides` are kept, so the pinned versions still apply.
 #
-# Updating for a new release:
-#   1. Set `version` and `publishedAt` (from `npm view omniroute time --json`).
-#   2. Set the hash for your system to `lib.fakeHash`, run `nix build`, and copy
-#      the "got:" value from the hash-mismatch error.
-#
-# The npm tree contains platform-specific binaries (sharp, @next/swc, esbuild,
-# ...), so there is one hash per system. Only systems listed in `hashes` are
-# supported; add yours after building on it.
+# `importNpmLock` fetches each dependency by the `integrity` in the lockfile,
+# so there is no dependency hash to maintain. To update after an npm release,
+# run `node scripts/release/update-nix-package.mjs [version]`. It rewrites
+# `package.json`, `package-lock.json` and the source hash below, and needs npm
+# but not Nix.
 {
   lib,
-  stdenv,
+  buildNpmPackage,
+  fetchurl,
+  importNpmLock,
   nodejs,
-  cacert,
-  makeWrapper,
 }: let
-  version = "3.8.50";
+  package = lib.importJSON ./package.json;
 
-  # The published tarball has no lockfile, so transitive dependencies would
-  # otherwise resolve to whatever is newest at build time and drift the hash.
-  # `--before` restricts resolution to versions that existed at release time.
-  publishedAt = "2026-08-28T16:19:48.276Z";
-
-  hashes = {
-    x86_64-linux = "sha256-JbdJndoVHtw1juTQmC9qIXVfwn8IER6Z/wblY2VlacA=";
-  };
-
-  npmInstall = stdenv.mkDerivation {
-    pname = "omniroute-npm-install";
-    inherit version;
-
-    dontUnpack = true;
-    dontConfigure = true;
-    dontBuild = true;
-    dontFixup = true;
-
-    nativeBuildInputs = [nodejs cacert];
-
-    installPhase = ''
-      runHook preInstall
-      export HOME="$NIX_BUILD_TOP/home"
-      mkdir -p "$HOME" "$out"
-      export npm_config_cache="$NIX_BUILD_TOP/.npm-cache"
-      export npm_config_prefix="$out"
-      export npm_config_userconfig="$HOME/.npmrc"
-      export npm_config_globalconfig="$HOME/.npmrc-global"
-      export SSL_CERT_FILE="${cacert}/etc/ssl/certs/ca-bundle.crt"
-      npm install -g \
-        --no-audit --no-fund --no-update-notifier \
-        --ignore-scripts \
-        --before=${publishedAt} \
-        omniroute@${version}
-      runHook postInstall
-    '';
-
-    outputHashMode = "recursive";
-    outputHashAlgo = "sha256";
-    outputHash = hashes.${stdenv.hostPlatform.system} or lib.fakeHash;
-  };
-
-  lib' = "${npmInstall}/lib/node_modules/omniroute";
+  # `importNpmLock` rewrites `dependencies` to store paths, and npm rejects an
+  # override that differs from its direct dependency (EOVERRIDE). Such overrides
+  # must already equal the dependency's range, so `$name` (npm's reference to
+  # the direct dependency) keeps the same meaning.
+  npmDepsPackage =
+    package
+    // {
+      overrides =
+        lib.mapAttrs (
+          name: value:
+            if builtins.isString value && package.dependencies ? ${name}
+            then "\$${name}"
+            else value
+        )
+        package.overrides;
+    };
 in
-  stdenv.mkDerivation {
+  buildNpmPackage {
     pname = "omniroute";
-    inherit version;
+    inherit (package) version;
+    inherit nodejs;
 
-    dontUnpack = true;
-    dontConfigure = true;
-    dontBuild = true;
+    src = fetchurl {
+      url = "https://registry.npmjs.org/omniroute/-/omniroute-${package.version}.tgz";
+      hash = "sha512-qK6REDWQYGh8lwGwDgFMsBqAMXnxIePudr8cSuSYeB9iIlywNhDJxHKt6Cwa31lPci8jXE5bbvl+az0lvyt0Mg==";
+    };
+    sourceRoot = "package";
 
-    nativeBuildInputs = [makeWrapper];
-
-    installPhase = ''
-      runHook preInstall
-      mkdir -p $out/bin
-      makeWrapper ${nodejs}/bin/node $out/bin/omniroute \
-        --add-flags ${lib'}/bin/omniroute.mjs \
-        --prefix PATH : ${lib.makeBinPath [nodejs]}
-      makeWrapper ${nodejs}/bin/node $out/bin/omniroute-reset-password \
-        --add-flags ${lib'}/bin/reset-password.mjs \
-        --prefix PATH : ${lib.makeBinPath [nodejs]}
-      runHook postInstall
+    postPatch = ''
+      cp ${./package.json} package.json
+      cp ${./package-lock.json} package-lock.json
     '';
 
-    passthru = {inherit npmInstall;};
+    npmDeps = importNpmLock {
+      package = npmDepsPackage;
+      packageLock = lib.importJSON ./package-lock.json;
+    };
+    npmConfigHook = importNpmLock.npmConfigHook;
+
+    # The published tarball omits .npmrc, which sets this upstream.
+    npmFlags = ["--legacy-peer-deps"];
+    # Several install scripts download binaries, which the sandbox forbids.
+    npmRebuildFlags = ["--ignore-scripts"];
+    # `npm pack` would otherwise run the dev-only `prepare` script.
+    npmPackFlags = ["--ignore-scripts"];
+    dontNpmBuild = true;
 
     meta = with lib; {
       description = "Unified AI router with automatic provider fallback";
       homepage = "https://github.com/diegosouzapw/OmniRoute";
       license = licenses.mit;
-      platforms = builtins.attrNames hashes;
       mainProgram = "omniroute";
     };
   }

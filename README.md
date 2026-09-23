@@ -1100,8 +1100,8 @@ npm run dev
 devbox run npm run dev
 ```
 
-The package is currently built for `x86_64-linux` only. See `nix/omniroute.nix`
-for how it is pinned and how to bump the version.
+The package is tested on `x86_64-linux`. After each npm release, update it with
+`node scripts/release/update-nix-package.mjs <version>` (needs npm, not Nix).
 
 📖 [Docker Guide](docs/guides/DOCKER_GUIDE.md) — Compose profiles, Caddy HTTPS, Cloudflare tunnels.
 
