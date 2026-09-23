@@ -97,7 +97,7 @@ in
     passthru = {inherit npmInstall;};
 
     meta = with lib; {
-      description = "Free MIT AI gateway: one endpoint, 350+ providers, 1200+ models with auto-fallback";
+      description = "Unified AI router with automatic provider fallback";
       homepage = "https://github.com/diegosouzapw/OmniRoute";
       license = licenses.mit;
       platforms = builtins.attrNames hashes;

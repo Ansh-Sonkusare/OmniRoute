@@ -1,5 +1,5 @@
 {
-  description = "OmniRoute — free MIT AI gateway: one endpoint, 350+ providers, 1200+ models with auto-fallback";
+  description = "OmniRoute - Unified AI router with 160+ providers";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-25.11";
@@ -24,7 +24,7 @@
           shellHook = ''
             echo "Welcome to OmniRoute dev environment"
             export PATH="$PWD/node_modules/.bin:$PATH"
-
+            
             # Install dependencies if node_modules doesn't exist
             if [ ! -d "node_modules" ]; then
               echo "Installing dependencies..."

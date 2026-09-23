@@ -1100,15 +1100,8 @@ npm run dev
 devbox run npm run dev
 ```
 
-The package installs the published `omniroute` npm release through a
-fixed-output derivation (FOD), because OmniRoute's `package-lock.json` references
-workspace packages that `npm ci --offline` cannot resolve inside the Nix sandbox.
-It is pinned to a release that is already on npm, so it can trail the newest
-`release/v*` branch until that version is published. The npm tree contains
-platform-specific binaries, so there is one `outputHash` per system; only
-`x86_64-linux` is currently listed in `nix/omniroute.nix`. Version bumps require
-updating `version`, `publishedAt` and the hash there (steps are in the file header).
-Runtime data lives in `DATA_DIR` (default `~/.omniroute/`), not in the Nix store.
+The package is currently built for `x86_64-linux` only. See `nix/omniroute.nix`
+for how it is pinned and how to bump the version.
 
 📖 [Docker Guide](docs/guides/DOCKER_GUIDE.md) — Compose profiles, Caddy HTTPS, Cloudflare tunnels.
 
