@@ -45,7 +45,7 @@ in
 
     src = fetchurl {
       url = "https://registry.npmjs.org/omniroute/-/omniroute-${package.version}.tgz";
-      hash = "sha512-qK6REDWQYGh8lwGwDgFMsBqAMXnxIePudr8cSuSYeB9iIlywNhDJxHKt6Cwa31lPci8jXE5bbvl+az0lvyt0Mg==";
+      hash = "sha512-VwwSt+bP9lJiPJXFJMz0nNGGuoewPZU3nFe1SLuO11ADgdSwTegGCxhg8Ov75+31m/cocPxHiO63zygn1XQ0MQ==";
     };
     sourceRoot = "package";
 

@@ -37,18 +37,22 @@ if (arg && !/^\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?$/.test(arg)) {
 const tmp = mkdtempSync(join(tmpdir(), "omniroute-nix-"));
 try {
   const version = arg || npm(["view", "omniroute", "version"]).trim();
-  const info = JSON.parse(
+  const viewed = JSON.parse(
     npm(["view", `omniroute@${version}`, "dist.integrity", "time", "--json"])
   );
+  // npm 12 wraps `view --json` in an array even for an exact version; npm 11 does not.
+  const info = Array.isArray(viewed) ? viewed[0] : viewed;
   const integrity = info["dist.integrity"];
   const publishedAt = info.time?.[version];
   if (!integrity?.startsWith("sha512-") || !publishedAt) {
     throw new Error(`omniroute@${version} has no sha512 integrity or publish time on npm`);
   }
 
-  const [{ filename }] = JSON.parse(
+  // npm 11 prints an array of pack results; npm 12 an object keyed by package name.
+  const packed = JSON.parse(
     npm(["pack", `omniroute@${version}`, "--json", `--pack-destination=${tmp}`])
   );
+  const { filename } = Array.isArray(packed) ? packed[0] : Object.values(packed)[0];
   execFileSync("tar", ["-xzf", join(tmp, filename), "-C", tmp, "package/package.json"]);
   const manifest = JSON.parse(readFileSync(join(tmp, "package", "package.json"), "utf8"));
   delete manifest.workspaces;
