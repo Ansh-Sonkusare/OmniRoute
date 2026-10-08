@@ -12,11 +12,21 @@
 # run `node scripts/release/update-nix-package.mjs [version]`. It rewrites
 # `package.json`, `package-lock.json` and the source hash below, and needs npm
 # but not Nix.
+#
+# Bin layout: `buildNpmPackage` links `$out/bin/omniroute` (and
+# `omniroute-reset-password`) to the files under `lib/node_modules/omniroute`, and its
+# shebang patching points them at the pinned `nodejs`. The CLI's own `serve` paths
+# (bin/cli/commands/serve.mjs, `runDaemon` and `runWithoutRecovery`) and its runtime
+# native-dependency installer (`npm`) still resolve `node`/`npm` through PATH, which a
+# NixOS user does not have by default. So every installed bin is wrapped with
+# `wrapProgram … --prefix PATH`, putting the same pinned `nodejs` (node + npm) first. The
+# wrapper only prefixes PATH; the `lib/node_modules` layout is left untouched.
 {
   lib,
   buildNpmPackage,
   fetchurl,
   importNpmLock,
+  makeWrapper,
   nodejs,
 }: let
   package = lib.importJSON ./package.json;
@@ -67,6 +77,13 @@ in
     # `npm pack` would otherwise run the dev-only `prepare` script.
     npmPackFlags = ["--ignore-scripts"];
     dontNpmBuild = true;
+
+    nativeBuildInputs = [makeWrapper];
+    postInstall = ''
+      for bin in $out/bin/*; do
+        wrapProgram "$bin" --prefix PATH : ${lib.makeBinPath [nodejs]}
+      done
+    '';
 
     meta = with lib; {
       description = "Unified AI router with automatic provider fallback";
