@@ -19,6 +19,7 @@ const LIST_URL = "https://grok.com/prod_mc_billing.ConsumerUiSvc/GetRemainingRes
 const REDEEM_URL = "https://grok.com/prod_mc_billing.ConsumerUiSvc/RedeemReset";
 const GRANTED = 1786560540;
 const EXPIRES = 1789238940;
+const FIXTURE_NOW_MS = Date.UTC(2026, 8, 6);
 const TOKEN_ID = "test-token-id";
 
 function encodeVarint(value: number): Buffer {
@@ -122,7 +123,8 @@ test.after(async () => {
   fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
 });
 
-test("listGrokResetCredits returns public rows without logging token ids in usage", async () => {
+test("listGrokResetCredits returns public rows without logging token ids in usage", async (t) => {
+  t.mock.timers.enable({ apis: ["Date"], now: FIXTURE_NOW_MS });
   const connection = (await createGrokConnection()) as { id: string };
   globalThis.fetch = async (url) => {
     if (String(url) === LIST_URL) return listResponse([{ id: TOKEN_ID, expires: EXPIRES }]);
@@ -192,4 +194,75 @@ test("consumeGrokResetCredit rejects non-grok connections", async () => {
       error.status === 400 &&
       error.code === "grok_provider_required"
   );
+});
+
+function redeemThenUsageFetch(creditUsagePercent: number): typeof fetch {
+  return (async (url) => {
+    if (String(url) === LIST_URL) return listResponse([{ id: TOKEN_ID, expires: EXPIRES }]);
+    if (String(url) === REDEEM_URL) return trailerResponse(0);
+    if (String(url).includes("/user?include=subscription")) {
+      return new Response(JSON.stringify({ userId: "u1", subscriptionTier: "SuperGrok Heavy" }), {
+        status: 200,
+      });
+    }
+    if (String(url).includes("/billing?format=credits")) {
+      return new Response(
+        JSON.stringify({
+          config: {
+            creditUsagePercent,
+            currentPeriod: { type: "WEEKLY", end: "2099-09-12T00:00:00.000Z" },
+          },
+        }),
+        { status: 200 }
+      );
+    }
+    if (String(url).includes("/auto-topup-rule")) {
+      return new Response(JSON.stringify({}), { status: 200 });
+    }
+    return usageJsonResponse();
+  }) as typeof fetch;
+}
+
+async function parkOnQuota429(id: string, testStatus = "unavailable") {
+  await providersDb.updateProviderConnection(id, {
+    testStatus,
+    rateLimitedUntil: new Date(Date.now() + 3 * 24 * 3_600_000).toISOString(),
+    lastError: "weekly limit reached",
+    lastErrorType: "rate_limited",
+    errorCode: 429,
+    backoffLevel: 2,
+  });
+}
+
+test("#4305 consumeGrokResetCredit releases the account's quota cooldown", async () => {
+  const connection = (await createGrokConnection()) as { id: string };
+  await parkOnQuota429(connection.id);
+  globalThis.fetch = redeemThenUsageFetch(0);
+
+  const result = await grokReset.consumeGrokResetCredit(connection.id, "redeem-4305", TOKEN_ID);
+  assert.equal(result.outcome, "reset");
+
+  const after = (await providersDb.getProviderConnectionById(connection.id)) as Record<
+    string,
+    unknown
+  >;
+  assert.equal(after.rateLimitedUntil ?? null, null);
+  assert.equal(after.testStatus, "active");
+  assert.equal(after.lastErrorType ?? null, null);
+  assert.equal(after.backoffLevel ?? 0, 0);
+});
+
+test("#4305 consumeGrokResetCredit never resets a terminal account", async () => {
+  const connection = (await createGrokConnection()) as { id: string };
+  await parkOnQuota429(connection.id, "banned");
+  globalThis.fetch = redeemThenUsageFetch(0);
+
+  await grokReset.consumeGrokResetCredit(connection.id, "redeem-4305-banned", TOKEN_ID);
+
+  const after = (await providersDb.getProviderConnectionById(connection.id)) as Record<
+    string,
+    unknown
+  >;
+  assert.equal(after.testStatus, "banned");
+  assert.ok(after.rateLimitedUntil);
 });

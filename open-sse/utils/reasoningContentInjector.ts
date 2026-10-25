@@ -20,7 +20,7 @@ type JsonRecord = Record<string, unknown>;
 /**
  * Model-id predicates for thinking-mode families that need the echo.
  * Matched case-insensitively against the resolved model id (post upstream
- * routing, e.g. `oc/deepseek-v4-flash-free` for the OpenCode meta-provider).
+ * routing, e.g. `opencode-zen/deepseek-v4-flash-free` for OpenCode Zen).
  */
 const THINKING_MODEL_PATTERNS: RegExp[] = [
   /deepseek/i,
@@ -55,16 +55,20 @@ export function isThinkingMessageModel(model: string | undefined | null): boolea
   return THINKING_MODEL_PATTERNS.some((re) => re.test(model));
 }
 
+/**
+ * `providerRequiresEcho` is resolved by the caller (Moonshot/Kimi legacy check,
+ * or a registry entry's `requiresReasoningContentEcho` capability flag — see
+ * `open-sse/config/providers/shared.ts`) so the provider allowlist lives in one
+ * place instead of being duplicated here. See issue #13599.
+ */
 export function shouldInjectReasoningContentPlaceholder(
+  providerRequiresEcho: boolean,
   provider: unknown,
   model: string | undefined | null
 ): boolean {
-  const normalizedProvider = String(provider ?? "")
-    .trim()
-    .toLowerCase();
   return (
-    (normalizedProvider === "moonshot" || normalizedProvider === "kimi") &&
-    !requiresAuthenticReasoningContent(normalizedProvider, model) &&
+    providerRequiresEcho &&
+    !requiresAuthenticReasoningContent(provider, model) &&
     isThinkingMessageModel(model)
   );
 }

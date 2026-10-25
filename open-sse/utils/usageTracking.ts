@@ -12,6 +12,7 @@ import {
 } from "@/lib/usage/tokenAccounting";
 import { FORMATS } from "../translator/formats.ts";
 import { pickCacheCreationTokens } from "./pickCacheCreationTokens.ts";
+import { sharedSymbol } from "@/shared/utils/processSingleton";
 
 export { pickCacheCreationTokens };
 
@@ -41,6 +42,9 @@ export interface UsageLike {
   no_cache_tokens?: number;
   reasoning_tokens?: number;
   cost_in_usd_ticks?: number;
+  provider_credits?: number;
+  /** Internal normalized provider-billed USD cost (from OpenRouter's `usage.cost`). */
+  cost_usd?: number;
   cache_read_input_tokens?: number;
   cache_creation_input_tokens?: number;
   /** OpenRouter / Devin Desktop / codex-chatgpt-web alias for cache creation. */
@@ -168,12 +172,8 @@ export function setBufferTokensCache(value: number): void {
 
 // Get HH:MM:SS timestamp
 function getTimeString() {
-  return new Date().toLocaleTimeString("en-US", {
-    hour12: false,
-    hour: "2-digit",
-    minute: "2-digit",
-    second: "2-digit",
-  });
+  const d = new Date();
+  return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}:${String(d.getSeconds()).padStart(2, "0")}`;
 }
 
 /**
@@ -225,6 +225,46 @@ export function addBufferToUsage(usage: UsageLike | null | undefined) {
   }
 
   return result;
+}
+
+/** Keep `cache_creation_in_prompt` when a rebuilt usage with the same prompt total replaces `from`. */
+export function carryCacheCreationMarker<T>(from: unknown, to: T): T {
+  if (!from || typeof from !== "object" || !to || typeof to !== "object") return to;
+  const source = from as Record<string, unknown>;
+  const target = to as Record<string, unknown>;
+  const promptTotal = (usage: Record<string, unknown>) => usage.prompt_tokens ?? usage.input_tokens;
+  if (promptTotal(source) === undefined || promptTotal(source) !== promptTotal(target)) return to;
+  for (const key of ["prompt_tokens_details", "input_tokens_details"]) {
+    const sourceDetails = source[key] as Record<string, unknown> | undefined;
+    const flag = sourceDetails?.cache_creation_in_prompt;
+    if (typeof flag !== "boolean") continue;
+    const targetDetails = target[key];
+    target[key] = {
+      ...(targetDetails && typeof targetDetails === "object" ? targetDetails : {}),
+      cache_creation_in_prompt: flag,
+    };
+  }
+  return to;
+}
+
+/**
+ * Provider-reported USD cost of a request, when the upstream supplied one.
+ * OpenRouter (and compatible resellers) send `usage.cost` as a bare USD number;
+ * a `{ total }` object is tolerated too, and an already-normalized `cost_usd`
+ * wins. Returns undefined for anything that is not a finite number >= 0.
+ */
+export function pickReportedCostUsd(usage: UsageLike | null | undefined): number | undefined {
+  if (!usage || typeof usage !== "object") return undefined;
+  const raw = usage.cost;
+  const candidates = [
+    usage.cost_usd,
+    raw,
+    raw && typeof raw === "object" ? (raw as { total?: unknown }).total : undefined,
+  ];
+  for (const value of candidates) {
+    if (typeof value === "number" && Number.isFinite(value) && value >= 0) return value;
+  }
+  return undefined;
 }
 
 export function filterUsageForFormat(usage: UsageLike | null | undefined, targetFormat: string) {
@@ -312,6 +352,7 @@ export function filterUsageForFormat(usage: UsageLike | null | undefined, target
       "output_tokens_details",
       "estimated",
       "cost_in_usd_ticks",
+      "provider_credits",
       "server_side_tool_usage_details",
       "server_side_tool_usage",
       "tokens_per_second",
@@ -330,7 +371,11 @@ export function filterUsageForFormat(usage: UsageLike | null | undefined, target
       "cache_read_input_tokens",
       "cache_creation_input_tokens",
       "estimated",
+      "cost_in_usd_ticks",
+      "provider_credits",
       "tokens_per_second",
+      // Provider-billed USD cost (OpenRouter), only when the upstream sent one.
+      "cost",
     ],
   };
 
@@ -344,6 +389,14 @@ export function filterUsageForFormat(usage: UsageLike | null | undefined, target
     fields = formatFields[FORMATS.OPENAI_RESPONSES];
   } else if (!fields) {
     fields = formatFields.default;
+  }
+
+  if (fields === formatFields.default) {
+    // Re-emit the provider-billed cost as a bare USD number (OpenRouter's own shape),
+    // also when only the normalized `cost_usd` survived extraction. Never estimated.
+    const reportedCostUsd = pickReportedCostUsd(convertedUsage);
+    if (reportedCostUsd === undefined) delete convertedUsage.cost;
+    else convertedUsage.cost = reportedCostUsd;
   }
 
   return pickFields(fields);
@@ -479,6 +532,8 @@ function clearCachedTokenDetail<T extends UsageTokenDetail | null | undefined>(v
   if (!value || typeof value !== "object" || Array.isArray(value)) return value;
   const result = { ...value };
   if (result.cached_tokens !== undefined) result.cached_tokens = 0;
+  if (result.cache_creation_tokens !== undefined) result.cache_creation_tokens = 0;
+  if (result.cache_write_tokens !== undefined) result.cache_write_tokens = 0;
   return result;
 }
 
@@ -513,6 +568,8 @@ export function sanitizeProviderUsageForRequest(
 
   if (format === FORMATS.CLAUDE) {
     result.input_tokens = estimatedInput;
+    result.prompt_tokens_details = clearCachedTokenDetail(result.prompt_tokens_details);
+    result.input_tokens_details = clearCachedTokenDetail(result.input_tokens_details);
     result.cache_read_input_tokens = 0;
     result.cache_creation_input_tokens = 0;
     return result;
@@ -531,6 +588,7 @@ export function sanitizeProviderUsageForRequest(
 
   if (format === FORMATS.OPENAI_RESPONSES) {
     result.input_tokens = estimatedInput;
+    result.prompt_tokens_details = clearCachedTokenDetail(result.prompt_tokens_details);
     result.input_tokens_details = clearCachedTokenDetail(result.input_tokens_details);
     result.cache_read_input_tokens = 0;
     result.cache_creation_input_tokens = 0;
@@ -624,9 +682,17 @@ export function normalizeUsage(usage: UsageLike | null | undefined) {
   assignNumber("output_tokens", usage?.output_tokens);
   assignNumber("cache_read_input_tokens", usage?.cache_read_input_tokens);
   assignNumber("cache_creation_input_tokens", pickCacheCreationTokens(usage));
-  assignNumber("cached_tokens", usage?.cached_tokens);
+  assignNumber(
+    "cached_tokens",
+    usage?.cached_tokens ??
+      usage?.prompt_tokens_details?.cached_tokens ??
+      usage?.input_tokens_details?.cached_tokens
+  );
   assignNumber("no_cache_tokens", usage?.no_cache_tokens);
   assignNumber("reasoning_tokens", usage?.reasoning_tokens);
+  // Credits metered by a credit-metered provider (see
+  // src/lib/usage/creditMeteredProviders.ts); provenance for cost_in_usd_ticks.
+  assignNumber("provider_credits", usage?.provider_credits);
   // xAI's exact provider-reported cost (port of decolua/9router#2453, capability A —
   // @ryanngit). Ticks → USD conversion happens in costCalculator.ts, not here.
   const exactCostTicks = usage?.cost_in_usd_ticks;
@@ -637,9 +703,41 @@ export function normalizeUsage(usage: UsageLike | null | undefined) {
   ) {
     normalized.cost_in_usd_ticks = exactCostTicks;
   }
+  // OpenRouter's provider-billed USD cost (`usage.cost`), kept under a distinct
+  // name so it is never conflated with xAI ticks; costCalculator prefers it over
+  // the token × pricing estimate.
+  const reportedCostUsd = pickReportedCostUsd(usage);
+  if (reportedCostUsd !== undefined) normalized.cost_usd = reportedCostUsd;
 
   if (Object.keys(normalized).length === 0) return null;
   return normalized;
+}
+
+// Internal marker for usage that was estimated locally (a web/cookie executor with no
+// upstream metering). A NON-enumerable symbol: JSON.stringify, object spread and
+// filterUsageForFormat never copy it, so it cannot reach a client payload or change any
+// usage field, cost or budget — it only lets the call-log sink tell estimated usage apart
+// after extraction rebuilt the object without the provider's `estimated` flag.
+const ESTIMATED_USAGE_MARKER = sharedSymbol("usage.estimated");
+
+export function carryEstimatedUsageMarker<T>(source: unknown, rebuilt: T): T {
+  const estimated =
+    !!source && typeof source === "object" && (source as UsageLike).estimated === true;
+  if (estimated && rebuilt && typeof rebuilt === "object") {
+    Object.defineProperty(rebuilt, ESTIMATED_USAGE_MARKER, { value: true, enumerable: false });
+  }
+  return rebuilt;
+}
+
+/**
+ * True when token usage was estimated locally instead of reported by the provider: either
+ * the usage still carries `estimated: true` (OmniRoute's own estimateUsage fallback) or
+ * extraction kept the internal marker. Observability only — billing does not read it.
+ */
+export function isEstimatedUsage(usage: unknown): boolean {
+  if (!usage || typeof usage !== "object") return false;
+  if ((usage as UsageLike).estimated === true) return true;
+  return Reflect.get(usage, ESTIMATED_USAGE_MARKER) === true;
 }
 
 /**
@@ -649,6 +747,19 @@ export function normalizeUsage(usage: UsageLike | null | undefined) {
  */
 export function hasValidUsage(usage: UsageLike | null | undefined) {
   if (!usage || typeof usage !== "object") return false;
+
+  // A credit measurement with its exact cost is billable usage even when the
+  // provider reported no tokens and no visible text.
+  if (
+    typeof usage.provider_credits === "number" &&
+    Number.isFinite(usage.provider_credits) &&
+    usage.provider_credits >= 0 &&
+    typeof usage.cost_in_usd_ticks === "number" &&
+    Number.isFinite(usage.cost_in_usd_ticks) &&
+    usage.cost_in_usd_ticks >= 0
+  ) {
+    return true;
+  }
 
   // Check for known token fields with value > 0
   const tokenFields = [
@@ -766,6 +877,8 @@ export function extractUsage(chunk: UsagePayloadLike | null | undefined) {
   ) {
     const usage = chunk.response.usage;
     return normalizeUsage({
+      provider_credits: usage.provider_credits,
+      cost_in_usd_ticks: usage.cost_in_usd_ticks,
       prompt_tokens: usage.input_tokens || usage.prompt_tokens || 0,
       completion_tokens: usage.output_tokens || usage.completion_tokens || 0,
       cached_tokens:
@@ -786,7 +899,7 @@ export function extractUsage(chunk: UsagePayloadLike | null | undefined) {
     typeof chunk.usage === "object" &&
     (chunk.usage.prompt_tokens !== undefined || chunk.usage.input_tokens !== undefined)
   ) {
-    return normalizeUsage({
+    const normalized = normalizeUsage({
       prompt_tokens: chunk.usage.prompt_tokens ?? chunk.usage.input_tokens ?? 0,
       completion_tokens: chunk.usage.completion_tokens ?? chunk.usage.output_tokens ?? 0,
       cached_tokens:
@@ -803,7 +916,11 @@ export function extractUsage(chunk: UsagePayloadLike | null | undefined) {
         chunk.usage.reasoning_tokens,
       // xAI's exact provider-reported cost (port of decolua/9router#2453, capability A).
       cost_in_usd_ticks: chunk.usage.cost_in_usd_ticks,
+      provider_credits: chunk.usage.provider_credits,
+      // OpenRouter's provider-billed USD cost (bare number in `usage.cost`).
+      cost_usd: pickReportedCostUsd(chunk.usage),
     });
+    return carryEstimatedUsageMarker(chunk.usage, normalized);
   }
 
   // Gemini format (Antigravity)
@@ -901,7 +1018,7 @@ export function estimateInputTokens(body: unknown) {
     }
 
     return messageTokens + toolTokens;
-  } catch (err) {
+  } catch {
     // Fallback if stringify fails
     return 0;
   }

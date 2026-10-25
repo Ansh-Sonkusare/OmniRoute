@@ -1,15 +1,15 @@
 import { createHash } from "node:crypto";
 import { homedir } from "node:os";
-import { mkdir, readFile, unlink, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import type {
   OmniRouteEnrichmentEntry,
   OmniRouteEnrichmentMap,
   OmniRouteProviderConnection,
-  OmniRouteRawAutoCombo,
   OmniRouteRawCombo,
   OmniRouteRawModelEntry,
 } from "./shared/index.js";
+import { isHttpUrl } from "./shared/index.js";
 
 export const DEFAULT_MODEL_CACHE_TTL_MS = 300_000 as const;
 
@@ -24,7 +24,6 @@ export const UNREACHABLE_COOLDOWN_MS = 15_000 as const;
 export interface CatalogSnapshot {
   models: OmniRouteRawModelEntry[];
   combos: OmniRouteRawCombo[];
-  autoCombos: OmniRouteRawAutoCombo[];
   providers?: OmniRouteProviderConnection[];
   enrichment?: OmniRouteEnrichmentMap;
   fetchedAt: number;
@@ -34,8 +33,9 @@ export const SNAPSHOT_FORMAT_VERSION = 2 as const;
 
 /**
  * A raw snapshot entry is stale when it cannot be mapped to a publishable
- * model: no string `id` (unroutable) or a pre-mapped `api` block without a
- * valid `npm` package (the runner would reject it as `Unsupported package`).
+ * model: no string `id` (unroutable), or a pre-mapped `api` block missing a
+ * valid `npm` package (the runner would reject it as `Unsupported package`)
+ * or a usable `url` (the host would reach the AI SDK with no baseURL).
  * Plain `/v1/models` entries carry no `api` block -- it is synthesized at
  * publish time -- so only a present-but-invalid block drops the entry.
  */
@@ -47,7 +47,11 @@ export function isStaleSnapshotModel(entry: unknown): boolean {
   if (api === undefined) return false;
   if (!api || typeof api !== "object") return true;
   const npm = (api as { npm?: unknown }).npm;
-  return typeof npm !== "string" || npm.length === 0;
+  if (typeof npm !== "string" || npm.length === 0) return true;
+  // Same requirement as `npm`, and the same predicate the options schema
+  // applies to `baseURL`: a pre-mapped block without a callable `url` publishes
+  // a model the host cannot route -- see `legacyApiToInfoApi`.
+  return !isHttpUrl((api as { url?: unknown }).url);
 }
 
 interface DiskSnapshotV2 {
@@ -55,7 +59,6 @@ interface DiskSnapshotV2 {
   identityFingerprint: string;
   models: OmniRouteRawModelEntry[];
   combos: OmniRouteRawCombo[];
-  autoCombos?: OmniRouteRawAutoCombo[];
   providers?: OmniRouteProviderConnection[];
   /**
    * Display names, provider labels, pricing and free-tier budgets, as
@@ -74,6 +77,12 @@ interface DiskSnapshotV2 {
  * rather than losing the catalog itself.
  */
 const MAX_SNAPSHOT_BYTES = 32 * 1024 * 1024;
+
+// Suffix for the temp file each write publishes via rename. Monotone per
+// process: two writes for one provider (for example across a credential
+// rotation) must not share a temp name. Built after the empty-models and
+// size-cap guards, so only real attempts consume a value.
+let snapshotWriteCounter = 0;
 
 function trimTrailingSlashes(value: string): string {
   let i = value.length;
@@ -123,11 +132,16 @@ export async function readDiskSnapshot(
 ): Promise<CatalogSnapshot | undefined> {
   try {
     const body = await readFile(diskSnapshotPath(providerId), "utf8");
-    const parsed = JSON.parse(body) as Partial<DiskSnapshotV2>;
+    // A retired snapshot field survives JSON.parse as an unknown key and is
+    // never read back, so legacy snapshots load with it ignored.
+    const parsed = JSON.parse(body) as Partial<DiskSnapshotV2> & {
+      autoCombos?: unknown;
+    };
+    void (parsed as { autoCombos?: unknown }).autoCombos;
     if (
       !parsed ||
       typeof parsed.v !== "number" ||
-      parsed.v < SNAPSHOT_FORMAT_VERSION ||
+      parsed.v !== SNAPSHOT_FORMAT_VERSION ||
       typeof parsed.identityFingerprint !== "string" ||
       parsed.identityFingerprint !== identityFingerprint
     ) {
@@ -145,15 +159,14 @@ export async function readDiskSnapshot(
       (entry) => !isStaleSnapshotModel(entry)
     );
     if (stale > 0) {
-      logger?.warn(`[omniroute-v2] dropping ${stale} stale snapshot entries without api block`);
+      logger?.warn(
+        `[omniroute-v2] dropping ${stale} stale snapshot entries with an unusable api block`
+      );
     }
     if (models.length === 0) return undefined;
     return {
       models,
       combos: parsed.combos as OmniRouteRawCombo[],
-      autoCombos: Array.isArray(parsed.autoCombos)
-        ? (parsed.autoCombos as OmniRouteRawAutoCombo[])
-        : [],
       providers: Array.isArray(parsed.providers)
         ? (parsed.providers as OmniRouteProviderConnection[])
         : [],
@@ -173,8 +186,14 @@ export async function readDiskSnapshot(
 export async function writeDiskSnapshot(
   providerId: string,
   snapshot: CatalogSnapshot,
-  identityFingerprint: string
+  identityFingerprint: string,
+  logger?: { warn: (message: string) => void }
 ): Promise<void> {
+  // Monotone per-process suffix: two writes for one provider (for example
+  // across a credential rotation) must not share a temp name. Declared here
+  // so the catch below can clean it up; assigned after the guards so only
+  // real attempts consume a counter value.
+  let tmp = "";
   try {
     if (snapshot.models.length === 0) return;
     const file = diskSnapshotPath(providerId);
@@ -184,20 +203,38 @@ export async function writeDiskSnapshot(
       identityFingerprint,
       models: snapshot.models,
       combos: snapshot.combos,
-      autoCombos: snapshot.autoCombos,
       providers: snapshot.providers ?? [],
       enrichment: snapshot.enrichment ? [...snapshot.enrichment.entries()] : undefined,
       writtenAt: Date.now(),
     };
     let payload = JSON.stringify(envelope);
-    if (payload.length > MAX_SNAPSHOT_BYTES && envelope.enrichment !== undefined) {
+    if (
+      Buffer.byteLength(payload, "utf8") > MAX_SNAPSHOT_BYTES &&
+      envelope.enrichment !== undefined
+    ) {
       delete envelope.enrichment;
       payload = JSON.stringify(envelope);
     }
-    if (payload.length > MAX_SNAPSHOT_BYTES) return;
-    await writeFile(file, payload, { encoding: "utf8", mode: 0o600 });
-  } catch {
+    if (Buffer.byteLength(payload, "utf8") > MAX_SNAPSHOT_BYTES) {
+      logger?.warn(
+        `[omniroute-v2] snapshot for ${providerId} exceeds the size cap, skipping disk write`
+      );
+      return;
+    }
+    tmp = `${file}.${process.pid}.${snapshotWriteCounter++}`;
+    await writeFile(tmp, payload, { encoding: "utf8", mode: 0o600 });
+    await rename(tmp, file);
+  } catch (err) {
     // Best-effort: callers already hold the in-memory entry.
+    logger?.warn(
+      `[omniroute-v2] snapshot write failed for ${providerId}: ` +
+        `${err instanceof Error ? err.message : String(err)}, keeping the in-memory entry`
+    );
+    try {
+      await unlink(tmp);
+    } catch {
+      // Ignore: the temp file may not exist (mkdir failed first).
+    }
   }
 }
 

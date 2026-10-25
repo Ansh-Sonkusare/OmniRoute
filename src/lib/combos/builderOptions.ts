@@ -30,6 +30,7 @@ type CustomModelLike = {
   apiFormat?: string;
   supportedEndpoints?: string[];
   inputTokenLimit?: number;
+  contextWindow?: number;
   outputTokenLimit?: number;
   supportsThinking?: boolean;
   isHidden?: boolean;
@@ -41,6 +42,7 @@ type SyncedModelLike = {
   source?: string;
   supportedEndpoints?: string[];
   inputTokenLimit?: number;
+  contextWindow?: number;
   outputTokenLimit?: number;
   description?: string;
   supportsThinking?: boolean;
@@ -384,7 +386,10 @@ function buildModelOptions(
       name: toStringOrNull(model.name),
       source: "imported",
       supportedEndpoints: toStringArray(model.supportedEndpoints),
-      contextLength: toNumberOrNull(model.inputTokenLimit) ?? resolved.contextWindow,
+      contextLength:
+        toNumberOrNull(model.contextWindow) ??
+        toNumberOrNull(model.inputTokenLimit) ??
+        resolved.contextWindow,
       outputTokenLimit: toNumberOrNull(model.outputTokenLimit) ?? resolved.maxOutputTokens,
       supportsThinking:
         typeof model.supportsThinking === "boolean"
@@ -438,6 +443,11 @@ function buildModelOptions(
         : variant.id;
       if (modelMap.has(rawId)) continue;
       const baseId = baseRawIdByVariantId.get(variant.id) ?? rawId;
+      // #16977: a hidden base's generated effort variants must not surface
+      // either — the base's visibility carries into everything expanded from
+      // it. (The variant's own exact-id hidden state is still checked inside
+      // addModelOption; this guards the base that no longer reaches the map.)
+      if (getModelIsHidden(providerId, baseId)) continue;
       const base = modelMap.get(baseId);
       addModelOption(modelMap, providerId, {
         id: rawId,
@@ -502,6 +512,8 @@ function buildModelOptions(
         : variant.id;
       if (modelMap.has(rawId)) continue;
       const baseId = baseRawIdByVariantId.get(variant.id) ?? rawId;
+      // #16977: same hidden-base guard as the synced-expansion loop above.
+      if (getModelIsHidden(providerId, baseId)) continue;
       const base = modelMap.get(baseId);
       addModelOption(modelMap, providerId, {
         id: rawId,
@@ -528,7 +540,7 @@ function buildModelOptions(
       source,
       supportedEndpoints: toStringArray(model.supportedEndpoints),
       apiFormat: toStringOrNull(model.apiFormat),
-      contextLength: toNumberOrNull(model.inputTokenLimit),
+      contextLength: toNumberOrNull(model.contextWindow) ?? toNumberOrNull(model.inputTokenLimit),
       outputTokenLimit: toNumberOrNull(model.outputTokenLimit),
       supportsThinking:
         typeof model.supportsThinking === "boolean" ? model.supportsThinking : undefined,
@@ -699,10 +711,13 @@ export async function getComboBuilderOptions(): Promise<ComboBuilderOptionsPaylo
       customModels
     );
 
-    // #2901 follow-up: a configured OpenCode connection shadows the no-auth
-    // entry below, so it must receive the same `oc/` routing prefix. The raw
-    // `opencode/` prefix is reserved by model parsing for the api-key tier.
-    const routingPrefix = providerId === "opencode" ? providerVisual.alias : providerId;
+    // #14135: custom provider nodes (provider-node source) configured with a prefix alias
+    // must route under their alias (e.g. "of/model"), not their raw internal database node id
+    // (e.g. "openai-compatible-chat-<uuid>/model").
+    const routingPrefix =
+      providerVisual.source === "provider-node" && providerVisual.alias
+        ? providerVisual.alias
+        : providerId;
     rewriteQualifiedModelPrefix(modelMap, providerId, routingPrefix);
 
     const normalizedConnections =
@@ -765,10 +780,9 @@ export async function getComboBuilderOptions(): Promise<ComboBuilderOptionsPaylo
       customModels
     );
 
-    // #2901: no-auth providers must route under their alias (e.g. "oc"), not
-    // their id — "opencode/<model>" misroutes to the opencode-zen api-key tier
-    // (manual ALIAS_TO_PROVIDER_ID override), while "oc/<model>" resolves to the
-    // no-auth "opencode" provider. Rewrite qualifiedModel to the alias prefix.
+    // #2901: no-auth providers must route under their alias, not their id — a
+    // raw id can collide with a manual ALIAS_TO_PROVIDER_ID override that points
+    // at another provider. Rewrite qualifiedModel to the alias prefix.
     const routingPrefix = noAuthProvider.alias || providerId;
     rewriteQualifiedModelPrefix(modelMap, providerId, routingPrefix);
 

@@ -5,11 +5,15 @@
  * context-optimized, context-relay, and fusion strategies
  */
 
-import { errorResponseWithComboDiagnostics } from "../utils/error.ts";
+import { errorResponse, errorResponseWithComboDiagnostics } from "../utils/error.ts";
+import { isProviderSafetyStopsEnabled } from "../utils/providerSafety.ts";
+import { createChaosHeaderBarrier } from "./combo/chaosHeaderBarrier.ts";
+import { runComboWithSafetyLatch } from "./combo/safetyStopLatch.ts";
 
 import { recordComboFailure } from "./combo/failureTracker.ts";
 import { buildRecoveryHint } from "./combo/pinRecovery.ts";
 import { buildTargetTimeoutRunner } from "./combo/targetTimeoutRunner.ts";
+import { costKey, resolvePoolCosts } from "./combo/candidateCost.ts";
 import { getComboMetrics } from "./comboMetrics.ts";
 import { qualityScoreFor } from "./routing/index.ts";
 import {
@@ -19,12 +23,9 @@ import {
 } from "./comboConfig.ts";
 
 import { getHiddenModelsByProvider } from "@/models";
+import { getHiddenChatModels } from "../../src/lib/hiddenChatModels";
 
-import {
-  evaluateQuotaCutoff,
-  getQuotaFetcher,
-  type QuotaInfo,
-} from "./quotaPreflight.ts";
+import { evaluateQuotaCutoff, getQuotaFetcher, type QuotaInfo } from "./quotaPreflight.ts";
 import { resolveProviderId } from "../../src/shared/constants/providers.ts";
 import { getQuotaFetchScope } from "./antigravityQuotaFamily.ts";
 import { getCircuitBreaker } from "../../src/shared/utils/circuitBreaker";
@@ -33,14 +34,11 @@ import { rejectRetiredAutoComboCandidates } from "./modelLifecycle.ts";
 import { createComboContext } from "./combo/context.ts";
 import { phaseComboSetup } from "./combo/comboSetup.ts";
 
-import { type ProviderCandidate } from "./autoCombo/scoring.ts";
+import { projectAccountTier, type ProviderCandidate } from "./autoCombo/scoring.ts";
 
 import { getSessionConnection } from "./sessionManager.ts";
 import { getOAuthSessionAvailability } from "./oauthSessionOccupancy.ts";
-import {
-  clearStickyBinding,
-  peekStickyConnectionId,
-} from "./combo/sessionStickiness.ts";
+import { clearStickyBinding, peekStickyConnectionId } from "./combo/sessionStickiness.ts";
 
 import { lookupPositiveCap } from "./combo/concurrencyCaps.ts";
 import { acquireQuotaShareConcurrencySlot } from "./combo/quotaShareConcurrency.ts";
@@ -50,7 +48,7 @@ import { getCachedProviderConnectionById } from "../../src/lib/db/readCache.ts";
 
 import { expandPromptCacheAffinityTargetsFromConnections } from "./combo/promptCacheAffinity.ts";
 
-import { getCachedProviderConnections } from "../../src/lib/db/readCache";
+import { getCachedProviderPoolConnections } from "./providerConnectionPool.ts";
 import {
   resolveResilienceSettings,
   type ResilienceSettings,
@@ -96,10 +94,16 @@ export {
 };
 import {
   applyNativeCodexTurnPin,
-  areAllPinnedTargetsModelScopedUnusable,
+  canAutoResumeNativeCodexTurn,
   createPinnedModelUnavailableResponse,
+  createPinnedModelRetryResponse,
   getNativeCodexTurnPin,
+  describePinnedTargetsLock,
+  releaseNativeCodexTurnPin,
+  resolvePinnedTurnUnusable,
+  resolvePinnedTargetsLockWaitMs,
 } from "./combo/nativeCodexTurnPin.ts";
+import { waitForCooldownAwareRetry } from "../../src/sse/services/cooldownAwareRetry.ts";
 import {
   pinIsDurablyUnhealthy,
   tryFusionDispatch,
@@ -107,20 +111,13 @@ import {
   tryPipelineDispatch,
   tryRuntimeUnitDispatch,
 } from "./combo/dispatchPrelude.ts";
-import {
-  resolveShadowTargets,
-  scheduleShadowRouting,
-} from "./combo/shadowRouting.ts";
+import { resolveShadowTargets, scheduleShadowRouting } from "./combo/shadowRouting.ts";
 import {
   filterTargetsByRequestCompatibility,
   resolveComboRuntimeUnits,
   resolveComboTargets,
 } from "./combo/comboStructure.ts";
-import {
-  createInvocationId,
-  getComboTrace,
-  startComboTrace,
-} from "./combo/decisionTrace.ts";
+import { createInvocationId, getComboTrace, startComboTrace } from "./combo/decisionTrace.ts";
 import {
   QUOTA_SOFT_DEPRIORITIZE_FACTOR,
   setCandidateQuotaSoftPenalty,
@@ -132,23 +129,36 @@ import {
 } from "./combo/autoStrategy.ts";
 import {
   resolveResetWindowConfig,
-  calculateResetWindowAffinity,
+  calculateAutoResetWindowAffinity,
+  resolveAutoResetWindowConfig,
   type ResetWindowConfig,
 } from "./combo/quotaScoring.ts";
-import {
-  fetchResetAwareQuotaWithCache,
-  preScreenTargets,
-} from "./combo/quotaStrategies.ts";
+import { fetchResetAwareQuotaWithCache, preScreenTargets } from "./combo/quotaStrategies.ts";
 import { buildAutoQuotaThresholds } from "./combo/quotaExhaustionCutoff.ts";
 import { expandTargetsByFingerprints } from "./combo/fingerprintExpansion.ts";
 import { resolveComboTargetPipeline } from "./combo/targetResolution.ts";
 import { dispatchWithCooldownRetry } from "./combo/comboAttemptLoop.ts";
 import { evaluateExecuteTargetGates } from "./combo/executeTargetGates.ts";
 import { executeTargetAttempt } from "./combo/executeTargetAttempt.ts";
-import type {
-  AttemptLoopDeps,
-  AttemptLoopState,
-} from "./combo/attemptLoopTypes.ts";
+import type { AttemptLoopDeps, AttemptLoopState } from "./combo/attemptLoopTypes.ts";
+import { clearStaleLKGP } from "./combo/staleLkgpClear.ts";
+import { getStrategyTraits } from "./combo/strategyRegistry.ts";
+
+// Native Codex auto-resume (#13180) rejection reasons that mean the turn either carries
+// state unsafe to hand to an untested alternate model (pending tool calls, opaque
+// provider-specific continuation state) or has already used its one allowed resume for
+// this logical turn. These must terminate the turn rather than fall through to #13564's
+// plain "release pin and route naturally" fallback. Every other reason (e.g. the request
+// does not use the Responses-API input/messages shape #13180's eligibility check needs)
+// falls through unchanged so non-native-turn-shaped Codex requests keep working exactly
+// as before #13180.
+const NATIVE_CODEX_AUTO_RESUME_UNSAFE_REASONS = new Set([
+  "pending_tool_call",
+  "unsafe_provider_state",
+  "no_alternate_target",
+  "no_healthy_alternate_target",
+  "max_resumes_exceeded",
+]);
 
 export { RESET_WINDOW_NAMES, QUOTA_SOFT_DEPRIORITIZE_FACTOR, setCandidateQuotaSoftPenalty };
 export { scoreAutoTargets, expandAutoComboCandidatePool };
@@ -175,6 +185,9 @@ export {
   validateComboDAG,
 } from "./combo/comboStructure.ts";
 
+// The lock check is `until > now`; waking exactly at `until` can still read locked.
+const PINNED_LOCK_WAIT_SLACK_MS = 50;
+
 /**
  * #6692: release a session-stickiness pin the moment its bound connection is
  * the one that just failed. applySessionStickiness() only re-checks health on
@@ -195,32 +208,8 @@ export function releaseStickyPinOnFailure(
   clearStickyBinding(messageHash);
 }
 
-/**
- * Clear persisted LKGP pins when a target fails or is skipped due to
- * exhaustion, cooldown, or unavailability (#11911 #919).
- */
-export function clearStaleLKGP(
-  comboName: string,
-  executionKey?: string | null,
-  comboId?: string | null,
-  log?: { warn?: (tag: string, msg: string, data?: unknown) => void } | null,
-  tag: string = "COMBO"
-): void {
-  void (async () => {
-    try {
-      const { clearLKGP } = await import("@/lib/db/settings");
-      const promises: Promise<void>[] = [clearLKGP(comboName, comboId || comboName)];
-      if (executionKey) {
-        promises.push(clearLKGP(comboName, executionKey));
-      }
-      await Promise.all(promises);
-    } catch (err) {
-      log?.warn?.(tag, "Failed to clear Last Known Good Provider. This is non-fatal.", {
-        err,
-      });
-    }
-  })();
-}
+// #11911 #919: non-blocking stale-pin clear whose failures log with combo context.
+export { clearStaleLKGP };
 
 const DEFAULT_MODEL_P95_MS: Record<string, number> = {
   "grok-4-fast-non-reasoning": 1143,
@@ -233,7 +222,6 @@ const DEFAULT_MODEL_P95_MS: Record<string, number> = {
   "deepseek-chat": 2000,
 };
 const MIN_HISTORY_SAMPLES = 10;
-const OUTPUT_TOKEN_RATIO = 0.4;
 
 function calculateTargetContextAffinity(
   target: ResolvedComboTarget,
@@ -246,16 +234,97 @@ function calculateTargetContextAffinity(
   return 0.1;
 }
 
-function getBootstrapLatencyMs(modelId: string): number {
-  const normalized = String(modelId || "").toLowerCase();
-  return DEFAULT_MODEL_P95_MS[normalized] ?? 1500;
+export function poolMedianP95Ms(
+  stats: Record<string, { p95LatencyMs?: unknown }>
+): number | undefined {
+  const vals = Object.values(stats)
+    .map((st) => Number(st?.p95LatencyMs))
+    .filter((v) => Number.isFinite(v) && v > 0)
+    .sort((a, b) => a - b);
+  return vals.length ? vals[(vals.length - 1) >> 1] : undefined;
+}
+
+const BOOTSTRAP_WARN_WINDOW_MS = 3600_000;
+export type BootstrapSource = "table" | "pool-median" | "constant";
+export const bootstrapSourceCounts: Record<BootstrapSource, number> = {
+  table: 0,
+  "pool-median": 0,
+  constant: 0,
+};
+let bootstrapWarnedAt = 0;
+export function resetBootstrapCounters(): void {
+  bootstrapSourceCounts.table = 0;
+  bootstrapSourceCounts["pool-median"] = 0;
+  bootstrapSourceCounts.constant = 0;
+  bootstrapWarnedAt = 0;
+}
+// Table lookup shared by the bootstrap provenance helpers below. Exact
+// normalization only (no provider/ prefix strip): callers pass parsed.model,
+// so stripping here would be dead code. Pricing strips prefixes; combo does not.
+function lookupTable(model: string): number | undefined {
+  return DEFAULT_MODEL_P95_MS[String(model || "").toLowerCase()];
+}
+// Single provenance authority: classifies a pre-resolved table value plus the
+// pool median. bootstrapMs routes through it so the hot path performs
+// exactly one table lookup on every call.
+export function bootstrapSourceFromTable(
+  table: number | undefined,
+  poolMedian: number | undefined
+): BootstrapSource {
+  if (table !== undefined) return "table";
+  if (poolMedian !== undefined) return "pool-median";
+  return "constant";
+}
+export function bootstrapMs(model: string, poolMedian: number | undefined): number {
+  const table = lookupTable(model);
+  bootstrapSourceCounts[bootstrapSourceFromTable(table, poolMedian)]++;
+  return table ?? poolMedian ?? 1500;
+}
+
+// Pure and testable without timers: the throttled 1h warn + cold-start exemption live here.
+export function shouldWarnBootstrap(
+  hits: number,
+  total: number,
+  hasStats: boolean,
+  now: number,
+  lastWarn: number
+): boolean {
+  if (!hasStats || total === 0) return false;
+  if (hits / total <= 0.3) return false;
+  return now - lastWarn >= BOOTSTRAP_WARN_WINDOW_MS;
+}
+
+// Deterministic on the module counters (not pure): reads bootstrapSourceCounts.
+// Table hits stay in the denominator to preserve the 30% threshold semantics
+// but out of the message — only estimates are reported.
+export function formatBootstrapWarning(): string {
+  const { table, "pool-median": pm, constant } = bootstrapSourceCounts;
+  const total = table + pm + constant;
+  const hits = pm + constant;
+  return `[combo] bootstrap latency dominant (${hits}/${total}, pool-median: ${pm}, constant: ${constant}) — scoring runs on guesses`;
+}
+
+export function maybeWarnBootstrapDominant(hasStats: boolean): void {
+  const { table, "pool-median": pm, constant } = bootstrapSourceCounts;
+  if (
+    !shouldWarnBootstrap(
+      pm + constant,
+      table + pm + constant,
+      hasStats,
+      Date.now(),
+      bootstrapWarnedAt
+    )
+  )
+    return;
+  bootstrapWarnedAt = Date.now();
+  console.warn(formatBootstrapWarning());
 }
 
 export async function buildAutoCandidates(
   targets: ResolvedComboTarget[],
   comboName: string,
   sessionId: string | null | undefined = null,
-  resetWindowConfig: ResetWindowConfig = resolveResetWindowConfig(null),
+  resetWindowConfig: ResetWindowConfig = resolveAutoResetWindowConfig(null),
   resilienceSettings: ResilienceSettings | null = null
 ): Promise<AutoProviderCandidate[]> {
   const hiddenModelsMap = getHiddenModelsByProvider();
@@ -278,6 +347,8 @@ export async function buildAutoCandidates(
   } catch {
     // keep empty stats — auto-combo will use runtime + bootstrap signals
   }
+  const poolMedian = poolMedianP95Ms(historicalLatencyStats);
+  const hasStats = Object.keys(historicalLatencyStats).length > 0;
 
   const uniqueProviders = Array.from(
     new Set(
@@ -290,7 +361,7 @@ export async function buildAutoCandidates(
   await Promise.all(
     uniqueProviders.map(async (provider) => {
       try {
-        const connections = (await getCachedProviderConnections({
+        const connections = (await getCachedProviderPoolConnections({
           provider,
           isActive: true,
         })) as Array<Record<string, unknown>>;
@@ -325,6 +396,17 @@ export async function buildAutoCandidates(
     }
   );
 
+  const poolCosts = await resolvePoolCosts(
+    fingerprintExpandedTargets.map((t) => {
+      const parsed = parseModel(t.modelStr);
+      return {
+        provider: t.provider || parsed.provider || parsed.providerAlias || "unknown",
+        model: parsed.model || t.modelStr,
+      };
+    }),
+    getPricingForModel
+  );
+
   const candidates = await Promise.all(
     fingerprintExpandedTargets.map(async (target) => {
       const modelStr = target.modelStr;
@@ -337,22 +419,7 @@ export async function buildAutoCandidates(
       const hasHistoricalSignal =
         Number.isFinite(historicalTotal) && historicalTotal >= MIN_HISTORY_SAMPLES;
 
-      let costPer1MTokens = 1;
-      try {
-        const pricing = await getPricingForModel(provider, model);
-        const inputPrice = Number(pricing?.input);
-        const outputPrice = Number(pricing?.output);
-        if (Number.isFinite(inputPrice) && inputPrice >= 0) {
-          if (Number.isFinite(outputPrice) && outputPrice >= 0) {
-            costPer1MTokens =
-              inputPrice * (1 - OUTPUT_TOKEN_RATIO) + outputPrice * OUTPUT_TOKEN_RATIO;
-          } else {
-            costPer1MTokens = inputPrice;
-          }
-        }
-      } catch {
-        // keep default cost
-      }
+      const costPer1MTokens = poolCosts.get(costKey(provider, model)) ?? 1;
 
       const modelMetric = metrics?.byModel?.[modelStr] || null;
       const avgLatency = Number(modelMetric?.avgLatencyMs);
@@ -364,10 +431,10 @@ export async function buildAutoCandidates(
       const p95LatencyMs = hasHistoricalSignal
         ? Number.isFinite(historicalP95Latency) && historicalP95Latency > 0
           ? historicalP95Latency
-          : getBootstrapLatencyMs(model)
+          : bootstrapMs(model, poolMedian)
         : Number.isFinite(avgLatency) && avgLatency > 0
           ? avgLatency
-          : getBootstrapLatencyMs(model);
+          : bootstrapMs(model, poolMedian);
 
       const errorRate = hasHistoricalSignal
         ? Number.isFinite(historicalSuccessRate) &&
@@ -422,6 +489,7 @@ export async function buildAutoCandidates(
       // time (scoreAutoTargets → STATUS_SOFT_DEPRIORITIZE_FACTOR) instead.
       let statusPenalty = false;
       let statusPenaltyReason: string | undefined;
+      let quotaUnreadable = false;
       if (statusCutoffReason) {
         quotaCutoffBlocked = true;
         quotaCutoffReason = statusCutoffReason;
@@ -450,12 +518,24 @@ export async function buildAutoCandidates(
           );
         }
         const quota = await quotaPromises.get(quotaKey)!;
-        resetWindowAffinity = calculateResetWindowAffinity(quota, resetWindowConfig);
+        resetWindowAffinity = calculateAutoResetWindowAffinity(quota, resetWindowConfig);
         if (!quotaCutoffBlocked) {
-          quotaRemaining = quotaRemainingPercentFromQuota(quota, {
+          const remaining = quotaRemainingPercentFromQuota(quota, {
             provider,
             requestedModel: modelStr,
           });
+          if (remaining === null) {
+            // #15347: this provider HAS a quota fetcher but gave us nothing readable (failed
+            // fetch, missing credentials, message-only or malformed payload). That is evidence
+            // about the telemetry, not the provider, so it must not outrank providers that
+            // reported a real percentage. Worst on the quota axis plus a soft penalty at
+            // scoring time (like #4540), so it ranks strictly below any real reading without
+            // being blocked or evicted. Unlimited plans report `unlimited: true` and score 100.
+            quotaRemaining = 0;
+            quotaUnreadable = true;
+          } else {
+            quotaRemaining = remaining;
+          }
         }
         if (!quotaCutoffBlocked && quotaCutoffEnabled) {
           const cutoffDecision = evaluateQuotaCutoff(
@@ -488,8 +568,15 @@ export async function buildAutoCandidates(
         latencyStdDev,
         errorRate,
         ...speedTelemetry,
-        accountTier: "standard" as const,
-        quotaResetIntervalSecs: 86400,
+        accountTier: projectAccountTier(connection as Record<string, unknown> | undefined),
+        quotaResetIntervalSecs: (() => {
+          const tierConn = connection as Record<string, unknown> | undefined;
+          const tierPsd = tierConn?.providerSpecificData as Record<string, unknown> | undefined;
+          const rawInterval = tierConn?.quotaResetIntervalSecs ?? tierPsd?.quotaResetIntervalSecs;
+          return typeof rawInterval === "number" && Number.isFinite(rawInterval) && rawInterval > 0
+            ? rawInterval
+            : 86400;
+        })(),
         contextAffinity,
         sessionAvailability,
         resetWindowAffinity,
@@ -497,6 +584,7 @@ export async function buildAutoCandidates(
         quotaCutoffReason,
         statusPenalty,
         statusPenaltyReason,
+        quotaUnreadable,
         connectionPoolSize: connectionPoolCounts.get(provider) ?? 1,
         connectionId: target.connectionId ?? undefined,
         authType,
@@ -509,6 +597,7 @@ export async function buildAutoCandidates(
 
   // Filter out candidates whose model is hidden by the user in the dashboard,
   // then drop vendor-retired ids so auto-combo cannot pick them (#11625).
+  maybeWarnBootstrapDominant(hasStats);
   return rejectRetiredAutoComboCandidates(
     candidates.filter((c) => {
       const hiddenModels = hiddenModelsMap.get(c.provider);
@@ -580,8 +669,22 @@ export async function resolveTargetTimeoutMsForTarget(
  * one metadata-only log line for durability across restarts.
  */
 export async function handleComboChat(options: HandleComboChatOptions): Promise<Response> {
-  const traceInvocationId = options.invocationId ?? createInvocationId();
-  const response = await handleComboChatInner({ ...options, invocationId: traceInvocationId });
+  const comboInvocationId = (options.combo as { traceInvocationId?: unknown } | null | undefined)
+    ?.traceInvocationId;
+  const traceInvocationId =
+    options.invocationId ??
+    (typeof comboInvocationId === "string" && comboInvocationId.length > 0
+      ? comboInvocationId
+      : createInvocationId());
+  // PROVIDER_SAFETY_STOPS_TERMINAL (#17049, default off): latch explicit provider safety
+  // stops as terminal for this invocation. Off, the combo runs exactly as before.
+  const response = isProviderSafetyStopsEnabled()
+    ? await runComboWithSafetyLatch(
+        { ...options, invocationId: traceInvocationId },
+        traceInvocationId,
+        handleComboChatInner
+      )
+    : await handleComboChatInner({ ...options, invocationId: traceInvocationId });
   response.headers.set("X-OmniRoute-Combo-Trace", traceInvocationId);
   const trace = getComboTrace(traceInvocationId);
   options.log.info(
@@ -603,7 +706,7 @@ async function handleComboChatInner({
   signal,
   apiKeyAllowedConnections = null,
   nesting = null,
-  hiddenModelsByProvider = getHiddenModelsByProvider(),
+  hiddenModelsByProvider,
   clientManagedResponsesContext = false,
   perTargetAdmission = null,
   deferContextOverflowWhenCompressible = false,
@@ -613,6 +716,7 @@ async function handleComboChatInner({
   requestHeaders = null,
   invocationId,
 }: HandleComboChatOptions): Promise<Response> {
+  hiddenModelsByProvider ??= await getHiddenChatModels();
   const comboCtx = createComboContext({ body, combo, settings, relayOptions, log });
   const {
     strategy,
@@ -696,6 +800,12 @@ async function handleComboChatInner({
 
   // Chaos mode (parallel multi-model dispatch): detection + dispatch live in
   // chaosEngine.ts (dispatchChaosFromCombo), returning null when not chaos-enabled.
+  // Chaos otherwise commits a synthetic SSE 200 before its panel returns headers.
+  // Only with PROVIDER_SAFETY_STOPS_TERMINAL (#17049); off, chaos dispatch is unchanged.
+  const chaosHeaders =
+    body.stream === true && isProviderSafetyStopsEnabled()
+      ? createChaosHeaderBarrier(handleSingleModelWithTimeout, perTargetAdmission, signal)
+      : null;
   const chaosDispatch = dispatchChaosFromCombo({
     cfg,
     comboModels: resolveComboTargets(
@@ -706,11 +816,15 @@ async function handleComboChatInner({
     ).map((target) => target.modelStr),
     comboName: combo.name,
     body,
-    handleSingleModel: handleSingleModelWithTimeout,
+    handleSingleModel: chaosHeaders?.handleSingleModel ?? handleSingleModelWithTimeout,
     log,
-    perTargetAdmission,
+    perTargetAdmission: chaosHeaders?.perTargetAdmission ?? perTargetAdmission,
   });
-  if (chaosDispatch) return chaosDispatch;
+  if (chaosDispatch) {
+    const response = await chaosDispatch;
+    await chaosHeaders?.wait();
+    return response;
+  }
 
   const pipelineDispatch = await tryPipelineDispatch({
     body,
@@ -752,14 +866,15 @@ async function handleComboChatInner({
   });
   if (runtimeUnitDispatch) return runtimeUnitDispatch;
 
-  const activeNativeTurnPin = clientManagedResponsesContext
+  let activeNativeTurnPin = clientManagedResponsesContext
     ? getNativeCodexTurnPin(body, combo.name)
     : null;
+  let isAutoResuming = false;
 
   // Route new round-robin turns to the specialized handler. A native Codex
   // continuation with an established provider/account pin must use the common
   // target pipeline below so it cannot rotate between tool rounds.
-  if (strategy === "round-robin" && !activeNativeTurnPin) {
+  if (getStrategyTraits(strategy).usesRoundRobinLoop && !activeNativeTurnPin) {
     const { handleRoundRobinCombo } = await import("./combo/roundRobinCombo.ts");
     return handleRoundRobinCombo({
       body,
@@ -783,7 +898,10 @@ async function handleComboChatInner({
     });
   }
 
-  const maxRetries = activeNativeTurnPin ? 0 : (config.maxRetries ?? 1);
+  // Native Codex turns must stay on their pinned target, but a pre-content
+  // stream failure is safe to retry because no output reached the client.
+  // Keep set retries disabled while preserving same-target retries.
+  const maxRetries = config.maxRetries ?? 1;
   const maxSetRetries = activeNativeTurnPin ? 0 : (config.maxSetRetries ?? 0);
   const setRetryDelayMs = resolveDelayMs(config.setRetryDelayMs, 2000);
 
@@ -805,45 +923,133 @@ async function handleComboChatInner({
     hiddenModelsByProvider,
   });
   if ("earlyResponse" in targetResolution) return targetResolution.earlyResponse;
-  const { stickyWeightedLimit, getWeightedStepKeyForTarget, preScreenMap } = targetResolution;
+  const { stickyWeightedLimit, getWeightedStepKeyForTarget, preScreenMap, compatRejectedTargets } =
+    targetResolution;
   const _sticky = targetResolution.sticky;
   let orderedTargets = targetResolution.orderedTargets;
   const quotaCutoffResetWindowConfig = resolveResetWindowConfig(config as Record<string, unknown>);
 
+  let pinnedLockWaitMs = 0;
   if (activeNativeTurnPin) {
-    const pinnedTargets = applyNativeCodexTurnPin(orderedTargets, activeNativeTurnPin);
+    const activeConnections = (await getCachedProviderPoolConnections({
+      provider: resolveProviderId(activeNativeTurnPin.provider),
+      isActive: true,
+    })) as Array<Record<string, unknown>>;
+    const activeConnectionIds = activeConnections
+      .map((connection) => String(connection.id))
+      .filter((id) => !apiKeyAllowedConnections?.length || apiKeyAllowedConnections.includes(id));
+    const pinnedTargets = applyNativeCodexTurnPin(
+      orderedTargets,
+      activeNativeTurnPin,
+      activeConnectionIds
+    );
     if (pinnedTargets.length === 0) {
-      //#11371: quota-share ordering reserved a winner slot; release on
-      //early exit (idempotent).
-      targetResolution.quotaShareRelease?.();
+      // Pinned model no longer exists in the combo — release pin and fall through
+      // to full combo routing so the turn can continue with a healthy model.
+      releaseNativeCodexTurnPin(body as Record<string, unknown>, combo.name);
       log.warn(
         "COMBO",
-        `Native Codex turn cannot continue: pinned model ${activeNativeTurnPin.modelStr} unavailable (target not in combo); preserving turn pin and terminating turn`
+        `Native Codex turn pin released: pinned model ${activeNativeTurnPin.modelStr} no longer in combo; falling back to full combo routing`
       );
-      return createPinnedModelUnavailableResponse();
-    }
-    const allPinnedUnusable = await areAllPinnedTargetsModelScopedUnusable({
-      pinnedTargets,
-      resilienceSettings,
-      quotaCutoffResetWindowConfig,
-      comboName: combo.name,
-      body: body as Record<string, unknown>,
-      log,
-      isModelAvailable,
-    });
-    if (allPinnedUnusable) {
-      targetResolution.quotaShareRelease?.();
-      log.warn(
-        "COMBO",
-        `Native Codex turn cannot continue: pinned model ${activeNativeTurnPin.modelStr} is unavailable (model-scoped); preserving turn pin and terminating turn`
-      );
-      return createPinnedModelUnavailableResponse();
     } else {
-      orderedTargets = pinnedTargets;
-      log.info(
-        "COMBO",
-        `Native Codex turn pinned to ${activeNativeTurnPin.modelStr} on connection ${activeNativeTurnPin.connectionId.slice(0, 8)}`
+      const resumePin = activeNativeTurnPin; // narrowed non-null here; the closure loses it
+      const evaluateAutoResume = () =>
+        canAutoResumeNativeCodexTurn({
+          body: body as Record<string, unknown>,
+          comboName: combo.name,
+          activePin: resumePin,
+          allTargets: orderedTargets,
+          resilienceSettings,
+          quotaCutoffResetWindowConfig,
+          isModelAvailable,
+          log,
+        });
+      const pinCheck = await resolvePinnedTurnUnusable(
+        {
+          pinnedTargets,
+          resilienceSettings,
+          quotaCutoffResetWindowConfig,
+          comboName: combo.name,
+          body: body as Record<string, unknown>,
+          log,
+          isModelAvailable,
+        },
+        evaluateAutoResume
       );
+      if (pinCheck.unusable) {
+        const autoResumeEligibility = pinCheck.decision ?? (await evaluateAutoResume());
+
+        if (autoResumeEligibility.eligible === true) {
+          const selectedAlternate = autoResumeEligibility.selectedTarget;
+          log.info(
+            "COMBO",
+            `Native Codex auto-resume eligible: previous provider/model=${activeNativeTurnPin.provider}/${activeNativeTurnPin.modelStr}, previous logical turn generation=${autoResumeEligibility.previousPin.generation ?? 0}, reason=model_scoped_unavailable`
+          );
+          log.info(
+            "COMBO",
+            `Native Codex auto-resume started: previous provider/model=${activeNativeTurnPin.provider}/${activeNativeTurnPin.modelStr}, target provider/model=${selectedAlternate.provider}/${selectedAlternate.modelStr}, target generation=${autoResumeEligibility.nextGeneration}`
+          );
+          const alternateTargets = orderedTargets.filter(
+            (t) =>
+              t.modelStr === selectedAlternate.modelStr && t.provider === selectedAlternate.provider
+          );
+          orderedTargets = alternateTargets;
+          activeNativeTurnPin = null;
+          isAutoResuming = true;
+        } else if (NATIVE_CODEX_AUTO_RESUME_UNSAFE_REASONS.has(autoResumeEligibility.reason)) {
+          const retryResponse = createPinnedModelRetryResponse(pinnedTargets);
+          if (retryResponse) {
+            targetResolution.quotaShareRelease?.();
+            log.warn("COMBO", "Pinned model temporarily unavailable; preserving turn for retry");
+            return retryResponse;
+          }
+          // These specific rejection reasons mean the turn carries state (pending
+          // tool calls, opaque provider-specific continuation state) or has
+          // already exhausted its resume budget, so handing it to an untested
+          // alternate model via natural combo routing (#13564's plain fallback)
+          // would be unsafe or would violate #13180's "at most one auto-resume
+          // per logical turn" bound. Terminate instead of falling through.
+          targetResolution.quotaShareRelease?.();
+          log.warn(
+            "COMBO",
+            `Native Codex turn cannot continue: pinned model ${activeNativeTurnPin.modelStr} is unavailable (model-scoped); auto-resume rejected (${autoResumeEligibility.reason}); model lock: ${describePinnedTargetsLock(pinnedTargets)}; preserving turn pin and terminating turn`
+          );
+          return createPinnedModelUnavailableResponse();
+        } else {
+          // Every other rejection reason (e.g. the request body does not carry
+          // the Responses-API `input`/`messages` shape #13180's eligibility
+          // check needs) means auto-resume simply cannot be evaluated — it says
+          // nothing about the request being unsafe. Fall back to the plain
+          // release-and-route-naturally behavior (#13564) so non-native-turn or
+          // legacy-shaped Codex requests keep working exactly as before #13180.
+          releaseNativeCodexTurnPin(body as Record<string, unknown>, combo.name);
+          log.warn(
+            "COMBO",
+            `Native Codex turn pin released: pinned model ${activeNativeTurnPin.modelStr} model-scoped unavailable; auto-resume not eligible (${autoResumeEligibility.reason}); falling back to full combo routing`
+          );
+        }
+      } else {
+        orderedTargets = pinnedTargets;
+        log.info(
+          "COMBO",
+          `Native Codex turn pinned to ${activeNativeTurnPin.modelStr} on connection ${activeNativeTurnPin.connectionId.slice(0, 8)}`
+        );
+        pinnedLockWaitMs = resolvePinnedTargetsLockWaitMs(pinnedTargets, resilienceSettings);
+        if (pinnedLockWaitMs > 0) {
+          log.info(
+            "COMBO",
+            `Native Codex turn pin: ${activeNativeTurnPin.modelStr} has a short transient lockout — waiting ${Math.ceil(pinnedLockWaitMs / 1000)}s before dispatch instead of terminating the turn`
+          );
+          const completed = await waitForCooldownAwareRetry(
+            pinnedLockWaitMs + PINNED_LOCK_WAIT_SLACK_MS,
+            signal
+          );
+          if (!completed) {
+            targetResolution.quotaShareRelease?.();
+            return errorResponse(499, "Request aborted");
+          }
+        }
+      }
     }
   }
 
@@ -896,8 +1102,14 @@ async function handleComboChatInner({
     strategy,
     resilienceSettings.comboCooldownWait
   );
-  const comboCooldownAttempt = { current: 0 };
-  const comboCooldownBudgetLeftMs = { current: resilienceSettings.comboCooldownWait.budgetMs };
+  const comboCooldownAttempt = { current: pinnedLockWaitMs > 0 ? 1 : 0 };
+  const comboCooldownBudgetLeftMs = {
+    current: Math.max(
+      0,
+      resilienceSettings.comboCooldownWait.budgetMs -
+        (pinnedLockWaitMs > 0 ? pinnedLockWaitMs + PINNED_LOCK_WAIT_SLACK_MS : 0)
+    ),
+  };
   const comboTimeoutMs = config.comboTimeoutMs || 0;
   const comboStartTime = Date.now();
 
@@ -922,6 +1134,7 @@ async function handleComboChatInner({
     globalAttempts: 0,
     observedFailure: false,
     allObservedFailuresQuota: true,
+    requestScopedFailureSeen: false,
     observeFailure(quotaExhausted, targetExecutionKey) {
       this.observedFailure = true;
       this.allObservedFailuresQuota &&= quotaExhausted;
@@ -951,6 +1164,7 @@ async function handleComboChatInner({
     traceInvocationId,
     clientRequestedStream,
     handleSingleModelWithTimeout,
+    requestHeaders,
     isModelAvailable,
     perTargetAdmission,
     signal,
@@ -959,10 +1173,12 @@ async function handleComboChatInner({
     releaseStickyPinOnFailure,
     clearStaleLKGP,
     clientManagedResponsesContext,
+    nativeCodexAutoResume: isAutoResuming,
     reasoningTokenBufferEnabled,
     stickyWeightedLimit,
     getWeightedStepKeyForTarget,
     universalHandoffConfig,
+    sourceFormat,
     relayOptions,
     relayConfig,
   };
@@ -977,10 +1193,8 @@ async function handleComboChatInner({
     comboCooldownBudgetLeftMs,
     evaluateGates: evaluateExecuteTargetGates,
     executeAttempt: executeTargetAttempt,
+    compatRejectedTargets,
   };
-
-  const quotaShareConcurrencyEnabled =
-    strategy === "quota-share" && resilienceSettings.quotaShareConcurrencyLimit.enabled;
 
   // FASE 2.1: acquire the per-connection concurrency slot for the selected
   // quota-share target once, around the whole dispatch (including any
@@ -990,7 +1204,8 @@ async function handleComboChatInner({
   // saturated queue is a no-op (fail-open). Released in the finally below.
   let quotaShareConcurrencyRelease: (() => void) | null = null;
   const qsConnectionId = orderedTargets[0]?.connectionId;
-  if (quotaShareConcurrencyEnabled && qsConnectionId) {
+  const qsLimitEnabled = resilienceSettings.quotaShareConcurrencyLimit.enabled;
+  if (getStrategyTraits(strategy).quotaShareConcurrencySlot && qsLimitEnabled && qsConnectionId) {
     const qsCap = await lookupPositiveCap(qsConnectionId);
     quotaShareConcurrencyRelease = await acquireQuotaShareConcurrencySlot(
       orderedTargets[0],
@@ -1014,4 +1229,3 @@ async function handleComboChatInner({
     _unregisterExecutionCandidates(_registeredExecutionKeys);
   }
 }
-
